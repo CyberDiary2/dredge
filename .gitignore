@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+venv/
+scannerShodan/
+server/
+*.txt
+*.json
+*.conf
+masscanResults.txt
+discovered-domains.txt
+ips.txt
+ips_backup.txt
+paused.conf
