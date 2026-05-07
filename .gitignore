@@ -11,3 +11,5 @@ discovered-domains.txt
 ips.txt
 ips_backup.txt
 paused.conf
+cut_eol.sh
+ipcleanerAzure.py
