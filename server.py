@@ -1,19 +1,82 @@
 from flask import Flask, request, jsonify, Response, render_template_string
 import json
+import os
+import subprocess
+import sys
+import threading
 from bson.regex import Regex
 import re
 from pymongo import MongoClient
+from functools import wraps
+
+DASHBOARD_USER = "drew"
+DASHBOARD_PASS = "dredge2026"
 
 app = Flask(__name__)
 mongo_uri = "mongodb://localhost:27017/"
 client = MongoClient(mongo_uri)
+db = client["scannerdb"]
+collection = db["sslchecker"]
+umbrella = db["umbrella"]
+stab_col = db["stab_results"]
+
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or auth.username != DASHBOARD_USER or auth.password != DASHBOARD_PASS:
+            return Response(
+                "authentication required",
+                401,
+                {"WWW-Authenticate": 'Basic realm="DREDGE"'}
+            )
+        return f(*args, **kwargs)
+    return decorated
+
+
+def get_umbrella_rank(domain):
+    if not domain:
+        return None
+    d = domain.lstrip("*.").lower()
+    result = umbrella.find_one({"domain": d}, {"rank": 1, "_id": 0})
+    return result["rank"] if result else None
+
+
+def get_takeover(domain):
+    if not domain:
+        return None
+    d = domain.lstrip("*.").lower()
+    result = stab_col.find_one({"subdomain": d}, {"type": 1, "service": 1, "_id": 0})
+    return result if result else None
+
+
+def enrich_with_rank(docs):
+    for doc in docs:
+        domain = None
+        for section in ["https_responseForDomainName", "http_responseForDomainName", "https_responseForIP", "http_responseForIP"]:
+            s = doc.get(section)
+            if not s:
+                continue
+            items = s if isinstance(s, list) else [s]
+            for item in items:
+                if item.get("domain"):
+                    domain = item["domain"]
+                    break
+            if domain:
+                break
+        doc["umbrella_rank"] = get_umbrella_rank(domain)
+        doc["takeover"] = get_takeover(domain)
+    return docs
 
 try:
-    db = client["scannerdb"]
-    collection = db["sslchecker"]
     print("MongoDB connection successful")
 except Exception as e:
     print(f"Error connecting to MongoDB: {str(e)}")
+
+_import_lock = threading.Lock()
+_import_status = {"running": False, "last_result": None, "error": None}
+_stab_status = {"running": False, "last_result": None, "error": None}
 
 
 @app.errorhandler(Exception)
@@ -84,6 +147,9 @@ DASHBOARD = """
       <div class="stat-card"><div class="label">total records</div><div class="value" id="stat-total">-</div></div>
       <div class="stat-card"><div class="label">unique domains</div><div class="value" id="stat-domains">-</div></div>
       <div class="stat-card"><div class="label">unique IPs</div><div class="value" id="stat-ips">-</div></div>
+      <div class="stat-card"><div class="label">umbrella domains</div><div class="value" id="stat-umbrella">-</div></div>
+      <div class="stat-card" style="border-color: #4a7c59;"><div class="label" style="color: #83c092;">in scope</div><div class="value" id="stat-inscope" style="color: #83c092;">-</div></div>
+      <div class="stat-card" style="border-color: #c03060;"><div class="label" style="color: #e67e80;">takeover candidates</div><div class="value" id="stat-takeovers" style="color: #e67e80;">-</div></div>
     </div>
 
     <div class="search-bar">
@@ -119,9 +185,56 @@ DASHBOARD = """
         <div class="field" style="justify-content: flex-end;">
           <button class="btn" onclick="loadAll()">show all</button>
         </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" style="background: #2d4a35; border: 1px solid #4a7c59; color: #83c092;" onclick="loadInScope()">in scope only</button>
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" id="btn-run-stab" style="background: #3a2e2e; border: 1px solid #e67e80; color: #e67e80;" onclick="runStab()">run stab</button>
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" id="btn-import-scopes" style="background: #3a3d2e; border: 1px solid #7fbbb3; color: #7fbbb3;" onclick="importScopes()">import scopes</button>
+        </div>
         <div class="field" style="justify-content: flex-end; margin-left: auto;">
           <button class="btn btn-danger" onclick="confirmDelete()">clear db</button>
         </div>
+      </div>
+    </div>
+
+    <div class="search-bar" style="border-color: #4a6c7c;">
+      <h2 style="color: #7fbbb3;">umbrella top 1M lookup</h2>
+      <div class="fields">
+        <div class="field">
+          <label style="color: #7fbbb3;">domain search</label>
+          <input type="text" id="u-domain" placeholder="t-mobile.com" style="border-color: #4a6c7c;">
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" style="background: #3a5a6c;" onclick="umbrellaSearch()">lookup</button>
+        </div>
+      </div>
+      <div id="umbrella-results" style="margin-top: 14px; display: none;">
+        <table>
+          <thead><tr><th>rank</th><th>domain</th></tr></thead>
+          <tbody id="umbrella-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="search-bar" style="border-color: #c03060;">
+      <h2 style="color: #e67e80;">takeover candidates</h2>
+      <div class="fields">
+        <div class="field">
+          <label style="color: #e67e80;">filter by domain</label>
+          <input type="text" id="t-filter" placeholder="t-mobile.com" style="border-color: #c03060;">
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" style="background: #4c3743; color: #e67e80; border: 1px solid #c03060;" onclick="loadTakeovers()">show takeovers</button>
+        </div>
+      </div>
+      <div id="takeover-results" style="margin-top: 14px; display: none;">
+        <table>
+          <thead><tr><th style="color:#e67e80;">subdomain</th><th style="color:#e67e80;">type</th><th style="color:#e67e80;">service</th><th style="color:#e67e80;">evidence</th><th style="color:#e67e80;">scanned</th></tr></thead>
+          <tbody id="takeover-tbody"></tbody>
+        </table>
       </div>
     </div>
 
@@ -130,6 +243,11 @@ DASHBOARD = """
     <div class="results-header">
       <h2>results</h2>
       <span class="count" id="result-count"></span>
+    </div>
+
+    <div id="pagination" style="display:none; gap:12px; align-items:center; margin-bottom:12px;">
+      <button class="btn" id="btn-prev" onclick="prevPage()">prev</button>
+      <button class="btn" id="btn-next" onclick="nextPage()">next</button>
     </div>
 
     <div id="results-container">
@@ -146,7 +264,146 @@ DASHBOARD = """
         document.getElementById('stat-total').textContent = data.total ?? '-';
         document.getElementById('stat-domains').textContent = data.unique_domains ?? '-';
         document.getElementById('stat-ips').textContent = data.unique_ips ?? '-';
+        document.getElementById('stat-umbrella').textContent = data.umbrella_count != null ? data.umbrella_count.toLocaleString() : '-';
+        const tc = data.takeover_count ?? 0;
+        document.getElementById('stat-takeovers').textContent = tc > 0 ? tc : '-';
+        const isc = data.in_scope_count ?? 0;
+        document.getElementById('stat-inscope').textContent = isc > 0 ? isc.toLocaleString() : '-';
       } catch(e) {}
+    }
+
+    let _stabPollInterval = null;
+
+    async function runStab() {
+      const domain = document.getElementById('f-domain').value.trim();
+      const btn = document.getElementById('btn-run-stab');
+      btn.disabled = true;
+      btn.textContent = domain ? `stab: ${domain}...` : 'stab running...';
+      try {
+        const r = await fetch('/run_stab', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({filter: domain})
+        });
+        if (r.status === 409) { btn.textContent = 'stab already running'; pollStabStatus(); return; }
+        pollStabStatus();
+      } catch(e) {
+        btn.disabled = false;
+        btn.textContent = 'run stab';
+      }
+    }
+
+    function pollStabStatus() {
+      if (_stabPollInterval) clearInterval(_stabPollInterval);
+      _stabPollInterval = setInterval(async () => {
+        try {
+          const r = await fetch('/run_stab/status');
+          const data = await r.json();
+          const btn = document.getElementById('btn-run-stab');
+          if (!data.running) {
+            clearInterval(_stabPollInterval);
+            btn.disabled = false;
+            btn.style.color = data.error ? '#e67e80' : '#83c092';
+            btn.textContent = data.error ? 'stab failed' : 'run stab';
+            if (!data.error) { fetchStats(); if (currentBaseUrl) fetchPage(); }
+          }
+        } catch(e) { clearInterval(_stabPollInterval); }
+      }, 3000);
+    }
+
+    let _importPollInterval = null;
+
+    async function importScopes() {
+      const btn = document.getElementById('btn-import-scopes');
+      btn.disabled = true;
+      btn.textContent = 'importing...';
+      btn.style.color = '#dbbc7f';
+      try {
+        const r = await fetch('/import_scopes', { method: 'POST' });
+        if (r.status === 409) {
+          btn.textContent = 'already running';
+          setTimeout(() => pollImportStatus(), 3000);
+          return;
+        }
+        pollImportStatus();
+      } catch(e) {
+        btn.textContent = 'import scopes';
+        btn.disabled = false;
+      }
+    }
+
+    function pollImportStatus() {
+      if (_importPollInterval) clearInterval(_importPollInterval);
+      _importPollInterval = setInterval(async () => {
+        try {
+          const r = await fetch('/import_scopes/status');
+          const data = await r.json();
+          const btn = document.getElementById('btn-import-scopes');
+          if (!data.running) {
+            clearInterval(_importPollInterval);
+            btn.disabled = false;
+            btn.style.color = '#83c092';
+            btn.textContent = data.error ? 'import failed' : 'import scopes';
+            if (!data.error) fetchStats();
+          }
+        } catch(e) {
+          clearInterval(_importPollInterval);
+        }
+      }, 3000);
+    }
+
+    async function loadTakeovers() {
+      const filter = document.getElementById('t-filter').value.trim();
+      const tbody = document.getElementById('takeover-tbody');
+      const panel = document.getElementById('takeover-results');
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#7fbbb3">loading...</td></tr>';
+      panel.style.display = 'block';
+      try {
+        const url = filter ? `/takeovers?filter=${encodeURIComponent(filter)}` : '/takeovers';
+        const r = await fetch(url);
+        const data = await r.json();
+        if (!data.results || data.results.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="color:#5c6a72">no takeover candidates -- run: python3 run_stab.py --domain &lt;target&gt;</td></tr>';
+          return;
+        }
+        const typeColor = t => t === 'cname_takeover' ? '#dbbc7f' : t === 's3_takeover' ? '#7fbbb3' : '#e67e80';
+        tbody.innerHTML = data.results.map(r => {
+          const evidence = r.evidence || r.ns_record || (Array.isArray(r.cname) ? r.cname.join(', ') : r.cname) || '-';
+          const scanned = r.scanned_at ? r.scanned_at.split('T')[0] : '-';
+          const type = r.type || '-';
+          return `<tr>
+            <td class="domain">${r.subdomain}</td>
+            <td style="color:${typeColor(type)}">${type}</td>
+            <td style="color:#83c092">${r.service || '-'}</td>
+            <td style="color:#5c6a72;font-size:0.8rem">${evidence}</td>
+            <td style="color:#5c6a72;font-size:0.8rem">${scanned}</td>
+          </tr>`;
+        }).join('');
+      } catch(e) {
+        tbody.innerHTML = `<tr><td colspan="5" style="color:#e67e80">error: ${e.message}</td></tr>`;
+      }
+    }
+
+    async function umbrellaSearch() {
+      const q = document.getElementById('u-domain').value.trim();
+      if (!q) return;
+      const tbody = document.getElementById('umbrella-tbody');
+      const panel = document.getElementById('umbrella-results');
+      tbody.innerHTML = '<tr><td colspan="2" style="color:#7fbbb3">searching...</td></tr>';
+      panel.style.display = 'block';
+      try {
+        const r = await fetch(`/umbrella/search?q=${encodeURIComponent(q)}&limit=50`);
+        const data = await r.json();
+        if (!data.results || data.results.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="2" style="color:#5c6a72">not found in top 1M</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.results.map(row =>
+          `<tr><td class="port">#${row.rank.toLocaleString()}</td><td class="domain">${row.domain}</td></tr>`
+        ).join('');
+      } catch(e) {
+        tbody.innerHTML = `<tr><td colspan="2" style="color:#e67e80">error: ${e.message}</td></tr>`;
+      }
     }
 
     function getFirstVal(doc, keys) {
@@ -189,19 +446,44 @@ DASHBOARD = """
         const protocols = new Set(requests.map(r => r.startsWith('https') ? 'https' : 'http'));
         const portTags = ports.map(p => `<span class="tag">${p}</span>`).join('');
         const protoTags = [...protocols].map(p => `<span class="tag ${p}">${p}</span>`).join('');
-        return `<tr>
+        const rank = doc.umbrella_rank ? `<span style="color:#dbbc7f">#${doc.umbrella_rank.toLocaleString()}</span>` : '<span style="color:#5c6a72">-</span>';
+        const to = doc.takeover;
+        const takeover = to
+          ? `<span style="background:#4c2020;color:#e67e80;padding:1px 7px;border-radius:3px;font-size:0.75rem;border:1px solid #c03060;" title="${to.service || ''}">${to.type.replace('_takeover','')}</span>`
+          : '<span style="color:#5c6a72">-</span>';
+        let scopeUrl = '#';
+        if (doc.in_scope_url) {
+          scopeUrl = doc.in_scope_url.includes('hackerone.com')
+            ? doc.in_scope_url + '#scope'
+            : doc.in_scope_url + '#scope';
+        }
+        const platform = doc.in_scope_platform === 'hackerone' ? 'H1' : doc.in_scope_platform === 'bugcrowd' ? 'BC' : '';
+        const program = doc.in_scope_program
+          ? `<a href="${scopeUrl}" target="_blank" style="color:#83c092;text-decoration:none;background:#2d4a35;padding:1px 7px;border-radius:3px;font-size:0.75rem;">${doc.in_scope_program}</a> <span style="color:#5c6a72;font-size:0.7rem;">${platform}</span>`
+          : '<span style="color:#5c6a72">-</span>';
+        const isVuln = !!doc.takeover;
+        const rowStyle = isVuln ? ' style="background:#2e1e1e;"' : (doc.in_scope_program ? ' style="background:#1e2e20;"' : '');
+        return `<tr${rowStyle}>
           <td class="domain">${domain || '<span style="color:#5c6a72">-</span>'}</td>
           <td class="ip">${ip || '-'}</td>
           <td class="port">${portTags || '-'}</td>
           <td>${protoTags}</td>
           <td class="title">${title || '<span style="color:#5c6a72">-</span>'}</td>
+          <td>${rank}</td>
+          <td>${program}</td>
+          <td>${takeover}</td>
         </tr>`;
       }).join('');
       return `<table>
-        <thead><tr><th>domain</th><th>IP</th><th>ports</th><th>protocol</th><th>title</th></tr></thead>
+        <thead><tr><th>domain</th><th>IP</th><th>ports</th><th>protocol</th><th>title</th><th>umbrella rank</th><th>program</th><th>takeover</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
     }
+
+    const PAGE_SIZE = 100;
+    let currentBaseUrl = '';
+    let currentOffset = 0;
+    let currentTotal = 0;
 
     function showError(msg) {
       const box = document.getElementById('error-box');
@@ -211,6 +493,36 @@ DASHBOARD = """
 
     function clearError() {
       document.getElementById('error-box').style.display = 'none';
+    }
+
+    async function fetchPage() {
+      const from = currentOffset;
+      const to = currentOffset + PAGE_SIZE;
+      const sep = currentBaseUrl.includes('?') ? '&' : '?';
+      const url = `${currentBaseUrl}${sep}from=${from}&to=${to}`;
+      document.getElementById('results-container').innerHTML = '<div class="loading">loading...</div>';
+      document.getElementById('result-count').textContent = '';
+      document.getElementById('pagination').style.display = 'none';
+      try {
+        const r = await fetch(url);
+        const data = await r.json();
+        const docs = Array.isArray(data) ? data : (data.entries || []);
+        currentTotal = data.total_entries ?? docs.length;
+        const page = Math.floor(currentOffset / PAGE_SIZE) + 1;
+        const totalPages = Math.ceil(currentTotal / PAGE_SIZE);
+        document.getElementById('result-count').textContent =
+          `${currentTotal} result${currentTotal !== 1 ? 's' : ''} -- page ${page} of ${totalPages}`;
+        document.getElementById('results-container').innerHTML = renderTable(docs);
+        const pagination = document.getElementById('pagination');
+        if (currentTotal > PAGE_SIZE) {
+          pagination.style.display = 'flex';
+          document.getElementById('btn-prev').disabled = currentOffset === 0;
+          document.getElementById('btn-next').disabled = currentOffset + PAGE_SIZE >= currentTotal;
+        }
+      } catch(e) {
+        showError('failed to load: ' + e.message);
+        document.getElementById('results-container').innerHTML = '';
+      }
     }
 
     async function runSearch() {
@@ -227,44 +539,41 @@ DASHBOARD = """
         return;
       }
 
-      document.getElementById('results-container').innerHTML = '<div class="loading">searching...</div>';
-      document.getElementById('result-count').textContent = '';
+      if (domain) currentBaseUrl = `/bydomain?domain=${encodeURIComponent(domain)}`;
+      else if (ip) currentBaseUrl = `/byip?ip=${encodeURIComponent(ip)}`;
+      else if (port) currentBaseUrl = `/byport?port=${encodeURIComponent(port)}`;
+      else if (title) currentBaseUrl = `/bytitle?title=${encodeURIComponent(title)}`;
+      else if (html) currentBaseUrl = `/byhtml?html=${encodeURIComponent(html)}`;
+      else if (header) currentBaseUrl = `/byhkeyresponse?hkeyresponse=${encodeURIComponent(header)}`;
 
-      let url = '';
-      if (domain) url = `/bydomain?domain=${encodeURIComponent(domain)}`;
-      else if (ip) url = `/byip?ip=${encodeURIComponent(ip)}`;
-      else if (port) url = `/byport?port=${encodeURIComponent(port)}&from=0&to=500`;
-      else if (title) url = `/bytitle?title=${encodeURIComponent(title)}&from=0&to=500`;
-      else if (html) url = `/byhtml?html=${encodeURIComponent(html)}&from=0&to=500`;
-      else if (header) url = `/byhkeyresponse?hkeyresponse=${encodeURIComponent(header)}&from=0&to=500`;
-
-      try {
-        const r = await fetch(url);
-        const data = await r.json();
-        const docs = Array.isArray(data) ? data : (data.entries || []);
-        const total = data.total_entries ?? docs.length;
-        document.getElementById('result-count').textContent = `${total} result${total !== 1 ? 's' : ''}`;
-        document.getElementById('results-container').innerHTML = renderTable(docs);
-      } catch(e) {
-        showError('search failed: ' + e.message);
-        document.getElementById('results-container').innerHTML = '';
-      }
+      currentOffset = 0;
+      await fetchPage();
     }
 
     async function loadAll() {
       clearError();
-      document.getElementById('results-container').innerHTML = '<div class="loading">loading...</div>';
-      document.getElementById('result-count').textContent = '';
-      try {
-        const r = await fetch('/all?from=0&to=200');
-        const data = await r.json();
-        const docs = data.entries || [];
-        const total = data.total_entries ?? docs.length;
-        document.getElementById('result-count').textContent = `showing ${docs.length} of ${total}`;
-        document.getElementById('results-container').innerHTML = renderTable(docs);
-      } catch(e) {
-        showError('failed to load: ' + e.message);
-      }
+      currentBaseUrl = '/all';
+      currentOffset = 0;
+      await fetchPage();
+    }
+
+    async function loadInScope() {
+      clearError();
+      currentBaseUrl = '/inscope';
+      currentOffset = 0;
+      await fetchPage();
+    }
+
+    function prevPage() {
+      if (currentOffset === 0) return;
+      currentOffset = Math.max(0, currentOffset - PAGE_SIZE);
+      fetchPage();
+    }
+
+    function nextPage() {
+      if (currentOffset + PAGE_SIZE >= currentTotal) return;
+      currentOffset += PAGE_SIZE;
+      fetchPage();
     }
 
     async function confirmDelete() {
@@ -282,7 +591,13 @@ DASHBOARD = """
     }
 
     document.addEventListener('keydown', e => {
-      if (e.key === 'Enter') runSearch();
+      if (e.key === 'Enter') {
+        if (document.activeElement && document.activeElement.id === 'u-domain') {
+          umbrellaSearch();
+        } else {
+          runSearch();
+        }
+      }
     });
 
     fetchStats();
@@ -293,11 +608,13 @@ DASHBOARD = """
 
 
 @app.route("/")
+@require_auth
 def dashboard():
     return render_template_string(DASHBOARD)
 
 
 @app.route("/stats")
+@require_auth
 def stats():
     try:
         total = collection.count_documents({})
@@ -314,25 +631,164 @@ def stats():
                         domains.add(item["domain"])
                     if item.get("ip"):
                         ips.add(item["ip"])
-        return jsonify({"total": total, "unique_domains": len(domains), "unique_ips": len(ips)})
+        umbrella_count = umbrella.count_documents({})
+        takeover_count = stab_col.count_documents({})
+        in_scope_count = collection.count_documents({"in_scope_program": {"$ne": None}})
+        return jsonify({"total": total, "unique_domains": len(domains), "unique_ips": len(ips), "umbrella_count": umbrella_count, "takeover_count": takeover_count, "in_scope_count": in_scope_count})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/all")
+@require_auth
 def all_records():
     try:
         from_index = int(request.args.get("from", 0))
         to_index = int(request.args.get("to", 200))
-        all_docs = list(collection.find({}, {"_id": 0}))
-        total = len(all_docs)
-        paginated = all_docs[from_index:to_index]
-        return Response(json.dumps({"total_entries": total, "entries": paginated}, indent=2), content_type="application/json")
+        limit = max(1, to_index - from_index)
+        total = collection.count_documents({})
+        docs = list(collection.find({}, {"_id": 0}).skip(from_index).limit(limit))
+        return Response(json.dumps({"total_entries": total, "entries": enrich_with_rank(docs)}, indent=2), content_type="application/json")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/inscope", methods=["GET"])
+@require_auth
+def inscope():
+    try:
+        from_index = int(request.args.get("from", 0))
+        to_index = int(request.args.get("to", 100))
+        program_filter = request.args.get("program", "").strip()
+        query = {"in_scope_program": {"$ne": None}}
+        if program_filter:
+            query["in_scope_program"] = Regex(re.escape(program_filter), "i")
+        total = collection.count_documents(query)
+        limit = max(1, to_index - from_index)
+        docs = list(collection.find(query, {"_id": 0}).skip(from_index).limit(limit))
+        return Response(json.dumps({"total_entries": total, "entries": enrich_with_rank(docs)}, indent=2), content_type="application/json")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/takeovers", methods=["GET"])
+@require_auth
+def takeovers():
+    try:
+        filter_param = request.args.get("filter", "").strip()
+        query = {"filter": {"$regex": filter_param, "$options": "i"}} if filter_param else {}
+        results = list(stab_col.find(query, {"_id": 0}).sort("scanned_at", -1))
+        return jsonify({"count": len(results), "results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/rank", methods=["GET"])
+@require_auth
+def rank():
+    try:
+        domain = request.args.get("domain", "").strip().lower().lstrip("*.")
+        if not domain:
+            return jsonify({"error": "domain parameter required"}), 400
+        result = umbrella.find_one({"domain": domain}, {"_id": 0})
+        if result:
+            return jsonify({"domain": domain, "rank": result["rank"]})
+        return jsonify({"domain": domain, "rank": None})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/umbrella/search", methods=["GET"])
+@require_auth
+def umbrella_search():
+    try:
+        q = request.args.get("q", "").strip().lower()
+        if not q:
+            return jsonify({"error": "q parameter required"}), 400
+        limit = int(request.args.get("limit", 50))
+        regex = Regex(rf".*{re.escape(q)}.*", "i")
+        results = list(umbrella.find({"domain": regex}, {"_id": 0}).sort("rank", 1).limit(limit))
+        return jsonify({"count": len(results), "results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/run_stab", methods=["POST"])
+@require_auth
+def trigger_run_stab():
+    global _stab_status
+    if _stab_status["running"]:
+        return jsonify({"status": "already_running"}), 409
+
+    domain_filter = (request.json or {}).get("filter", "").strip()
+
+    def run():
+        global _stab_status
+        _stab_status["running"] = True
+        _stab_status["error"] = None
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_stab.py")
+            cmd = [sys.executable, script]
+            if domain_filter:
+                cmd += ["--domain", domain_filter]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            _stab_status["last_result"] = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                _stab_status["error"] = result.stderr.strip()
+        except Exception as e:
+            _stab_status["error"] = str(e)
+            _stab_status["last_result"] = str(e)
+        finally:
+            _stab_status["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "started", "filter": domain_filter or "all"}), 202
+
+
+@app.route("/run_stab/status", methods=["GET"])
+@require_auth
+def run_stab_status():
+    return jsonify(_stab_status)
+
+
+@app.route("/import_scopes", methods=["POST"])
+@require_auth
+def trigger_import_scopes():
+    global _import_status
+    if _import_status["running"]:
+        return jsonify({"status": "already_running"}), 409
+
+    def run():
+        global _import_status
+        _import_status["running"] = True
+        _import_status["error"] = None
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "import_scopes.py")
+            result = subprocess.run(
+                [sys.executable, script],
+                capture_output=True, text=True, timeout=300
+            )
+            _import_status["last_result"] = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                _import_status["error"] = result.stderr.strip()
+        except Exception as e:
+            _import_status["error"] = str(e)
+            _import_status["last_result"] = str(e)
+        finally:
+            _import_status["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "started"}), 202
+
+
+@app.route("/import_scopes/status", methods=["GET"])
+@require_auth
+def import_scopes_status():
+    return jsonify(_import_status)
+
+
 @app.route("/<path:any_path>", methods=["GET"])
+@require_auth
 def respond_to_any_path(any_path):
     return jsonify({"message": f"Unknown endpoint: {any_path}"})
 
@@ -348,6 +804,7 @@ def insert():
 
 
 @app.route("/bytitle", methods=["GET"])
+@require_auth
 def bytitle():
     try:
         title_param = request.args.get("title")
@@ -362,17 +819,16 @@ def bytitle():
             {"http_responseForDomainName.title": regex},
             {"https_responseForDomainName.title": regex},
         ]}
-        matching = list(collection.find(query, {"_id": 0}))
-        total = len(matching)
-        from_index = max(0, min(from_index, total))
-        to_index = min(total, max(to_index, 0))
-        paginated = matching[from_index:to_index]
+        total = collection.count_documents(query)
+        limit = max(1, to_index - from_index)
+        paginated = list(collection.find(query, {"_id": 0}).skip(from_index).limit(limit))
         return Response(json.dumps({"total_entries": total, "entries": paginated}, indent=4), content_type="application/json")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/bydomain", methods=["GET"])
+@require_auth
 def bydomain():
     try:
         domain_param = request.args.get("domain")
@@ -385,12 +841,18 @@ def bydomain():
             {"http_responseForDomainName.domain": regex},
             {"https_responseForDomainName.domain": regex},
         ]}
-        return jsonify(list(collection.find(query, {"_id": 0})))
+        from_index = int(request.args.get("from", 0))
+        to_index = int(request.args.get("to", 100))
+        total = collection.count_documents(query)
+        limit = max(1, to_index - from_index)
+        docs = list(collection.find(query, {"_id": 0}).skip(from_index).limit(limit))
+        return Response(json.dumps({"total_entries": total, "entries": enrich_with_rank(docs)}, indent=4), content_type="application/json")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/byip", methods=["GET"])
+@require_auth
 def byip():
     try:
         ip_param = request.args.get("ip")
@@ -403,12 +865,18 @@ def byip():
             {"http_responseForDomainName.ip": regex},
             {"https_responseForDomainName.ip": regex},
         ]}
-        return jsonify(list(collection.find(query, {"_id": 0})))
+        from_index = int(request.args.get("from", 0))
+        to_index = int(request.args.get("to", 100))
+        total = collection.count_documents(query)
+        limit = max(1, to_index - from_index)
+        docs = list(collection.find(query, {"_id": 0}).skip(from_index).limit(limit))
+        return Response(json.dumps({"total_entries": total, "entries": enrich_with_rank(docs)}, indent=4), content_type="application/json")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/byport", methods=["GET"])
+@require_auth
 def byport():
     try:
         port_param = request.args.get("port")
@@ -423,16 +891,16 @@ def byport():
             {"http_responseForDomainName.port": regex},
             {"https_responseForDomainName.port": regex},
         ]}
-        matching = list(collection.find(query, {"_id": 0}))
-        total = len(matching)
-        from_index = max(0, min(from_index, total))
-        to_index = min(total, max(to_index, 0))
-        return Response(json.dumps({"total_entries": total, "entries": matching[from_index:to_index]}, indent=4), content_type="application/json")
+        total = collection.count_documents(query)
+        limit = max(1, to_index - from_index)
+        paginated = list(collection.find(query, {"_id": 0}).skip(from_index).limit(limit))
+        return Response(json.dumps({"total_entries": total, "entries": paginated}, indent=4), content_type="application/json")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/byhtml", methods=["GET"])
+@require_auth
 def byhtml():
     try:
         html_param = request.args.get("html")
@@ -447,16 +915,16 @@ def byhtml():
             {"http_responseForDomainName.response_text": regex},
             {"https_responseForDomainName.response_text": regex},
         ]}
-        matching = list(collection.find(query, {"_id": 0}))
-        total = len(matching)
-        from_index = max(0, min(from_index, total))
-        to_index = min(total, max(to_index, 0))
-        return Response(json.dumps({"total_entries": total, "entries": matching[from_index:to_index]}, indent=4), content_type="application/json")
+        total = collection.count_documents(query)
+        limit = max(1, to_index - from_index)
+        paginated = list(collection.find(query, {"_id": 0}).skip(from_index).limit(limit))
+        return Response(json.dumps({"total_entries": total, "entries": paginated}, indent=4), content_type="application/json")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/byhresponse", methods=["GET"])
+@require_auth
 def byhresponse():
     try:
         hresponse_param = request.args.get("hresponse")
@@ -497,6 +965,7 @@ def byhresponse():
 
 
 @app.route("/byhkeyresponse", methods=["GET"])
+@require_auth
 def byhkeyresponse():
     try:
         hkeyresponse_param = request.args.get("hkeyresponse")
@@ -537,6 +1006,7 @@ def byhkeyresponse():
 
 
 @app.route("/perform_delete", methods=["DELETE"])
+@require_auth
 def perform_delete():
     try:
         result = collection.delete_many({})
