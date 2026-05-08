@@ -655,7 +655,10 @@ DASHBOARD = """
             ? doc.in_scope_url + '#scope'
             : doc.in_scope_url + '#scope';
         }
-        const platform = doc.in_scope_platform === 'hackerone' ? 'H1' : doc.in_scope_platform === 'bugcrowd' ? 'BC' : '';
+        const platform = doc.in_scope_platform === 'hackerone' ? 'H1' :
+          doc.in_scope_platform === 'hackerone_vdp' ? 'H1 VDP' :
+          doc.in_scope_platform === 'bugcrowd' ? 'BC' :
+          doc.in_scope_platform === 'bugcrowd_vdp' ? 'BC VDP' : '';
         const program = doc.in_scope_program
           ? `<a href="${scopeUrl}" target="_blank" style="color:#83c092;text-decoration:none;background:#2d4a35;padding:1px 7px;border-radius:3px;font-size:0.75rem;">${doc.in_scope_program}</a> <span style="color:#5c6a72;font-size:0.7rem;">${platform}</span>`
           : '<span style="color:#5c6a72">-</span>';
