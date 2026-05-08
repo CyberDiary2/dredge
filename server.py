@@ -19,6 +19,7 @@ db = client["scannerdb"]
 collection = db["sslchecker"]
 umbrella = db["umbrella"]
 stab_col = db["stab_results"]
+draco_col = db["draco_results"]
 
 
 def require_auth(f):
@@ -77,6 +78,7 @@ except Exception as e:
 _import_lock = threading.Lock()
 _import_status = {"running": False, "last_result": None, "error": None}
 _stab_status = {"running": False, "last_result": None, "error": None}
+_draco_status = {"running": False, "last_result": None, "error": None}
 
 
 @app.errorhandler(Exception)
@@ -150,6 +152,7 @@ DASHBOARD = """
       <div class="stat-card"><div class="label">umbrella domains</div><div class="value" id="stat-umbrella">-</div></div>
       <div class="stat-card" style="border-color: #4a7c59;"><div class="label" style="color: #83c092;">in scope</div><div class="value" id="stat-inscope" style="color: #83c092;">-</div></div>
       <div class="stat-card" style="border-color: #c03060;"><div class="label" style="color: #e67e80;">takeover candidates</div><div class="value" id="stat-takeovers" style="color: #e67e80;">-</div></div>
+      <div class="stat-card" style="border-color: #7fbbb3;"><div class="label" style="color: #7fbbb3;">cloud assets</div><div class="value" id="stat-cloud" style="color: #7fbbb3;">-</div></div>
     </div>
 
     <div class="search-bar">
@@ -241,6 +244,35 @@ DASHBOARD = """
       </div>
     </div>
 
+    <div class="search-bar" style="border-color: #4a6c7c;">
+      <h2 style="color: #7fbbb3;">cloud assets (draco)</h2>
+      <div class="fields">
+        <div class="field">
+          <label style="color: #7fbbb3;">target domain</label>
+          <input type="text" id="d-domain" placeholder="t-mobile.com" style="border-color: #4a6c7c;">
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" id="btn-run-draco" style="background: #3a5a6c; border: 1px solid #7fbbb3; color: #7fbbb3;" onclick="runDraco()">run draco</button>
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" style="background: #2d4050; border: 1px solid #7fbbb3; color: #7fbbb3;" onclick="loadDraco()">show results</button>
+        </div>
+      </div>
+      <div id="draco-results" style="margin-top: 14px; display: none;">
+        <table>
+          <thead><tr>
+            <th style="color:#7fbbb3;">provider</th>
+            <th style="color:#7fbbb3;">type</th>
+            <th style="color:#7fbbb3;">asset</th>
+            <th style="color:#7fbbb3;">severity</th>
+            <th style="color:#7fbbb3;">detail</th>
+            <th style="color:#7fbbb3;">scanned</th>
+          </tr></thead>
+          <tbody id="draco-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <div id="error-box" style="display:none" class="error"></div>
 
     <div class="results-header">
@@ -270,6 +302,8 @@ DASHBOARD = """
         document.getElementById('stat-umbrella').textContent = data.umbrella_count != null ? data.umbrella_count.toLocaleString() : '-';
         const tc = data.takeover_count ?? 0;
         document.getElementById('stat-takeovers').textContent = tc > 0 ? tc : '-';
+        const cc = data.cloud_count ?? 0;
+        document.getElementById('stat-cloud').textContent = cc > 0 ? cc.toLocaleString() : '-';
         const isc = data.in_scope_count ?? 0;
         document.getElementById('stat-inscope').textContent = isc > 0 ? isc.toLocaleString() : '-';
       } catch(e) {}
@@ -353,6 +387,89 @@ DASHBOARD = """
           clearInterval(_importPollInterval);
         }
       }, 3000);
+    }
+
+    let _dracoPollInterval = null;
+
+    async function runDraco() {
+      const domain = document.getElementById('d-domain').value.trim();
+      if (!domain) { alert('enter a target domain'); return; }
+      const btn = document.getElementById('btn-run-draco');
+      btn.disabled = true;
+      btn.textContent = `draco: ${domain}...`;
+      try {
+        const r = await fetch('/run_draco', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({domain})
+        });
+        if (r.status === 409) { btn.textContent = 'draco already running'; pollDracoStatus(); return; }
+        pollDracoStatus();
+      } catch(e) { btn.disabled = false; btn.textContent = 'run draco'; }
+    }
+
+    function pollDracoStatus() {
+      if (_dracoPollInterval) clearInterval(_dracoPollInterval);
+      _dracoPollInterval = setInterval(async () => {
+        try {
+          const r = await fetch('/run_draco/status');
+          const data = await r.json();
+          const btn = document.getElementById('btn-run-draco');
+          if (!data.running) {
+            clearInterval(_dracoPollInterval);
+            btn.disabled = false;
+            btn.style.color = data.error ? '#e67e80' : '#83c092';
+            btn.textContent = data.error ? 'draco failed' : 'run draco';
+            if (!data.error) { fetchStats(); loadDraco(); }
+          }
+        } catch(e) { clearInterval(_dracoPollInterval); }
+      }, 3000);
+    }
+
+    async function loadDraco() {
+      const domain = document.getElementById('d-domain').value.trim();
+      const tbody = document.getElementById('draco-tbody');
+      const panel = document.getElementById('draco-results');
+      tbody.innerHTML = '<tr><td colspan="6" style="color:#7fbbb3">loading...</td></tr>';
+      panel.style.display = 'block';
+      try {
+        let url = '/draco_results';
+        if (domain) url += `?domain=${encodeURIComponent(domain)}`;
+        const r = await fetch(url);
+        const data = await r.json();
+        if (!data.results || data.results.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:#5c6a72">no cloud assets found -- run draco on a target domain</td></tr>';
+          return;
+        }
+        const sevColor = s => s === 'critical' ? '#e67e80' : s === 'high' ? '#dbbc7f' : s === 'medium' ? '#a7c080' : s === 'low' ? '#7fbbb3' : '#5c6a72';
+        const provider = t => ['s3_bucket','cloudfront','api_gateway','lambda_url','ecr_public'].includes(t) ? 'AWS' :
+          t.startsWith('azure') ? 'Azure' :
+          ['gcs_bucket','firebase_db','app_engine','cloud_run'].includes(t) ? 'GCP' : 'Intel';
+        const typeLabel = {
+          s3_bucket:'S3 Bucket', cloudfront:'CloudFront', api_gateway:'API Gateway', lambda_url:'Lambda URL', ecr_public:'ECR Public',
+          azure_blob:'Blob Storage', azure_app_service:'App Service', azure_cdn:'CDN', azure_front_door:'Front Door',
+          gcs_bucket:'GCS Bucket', firebase_db:'Firebase DB', app_engine:'App Engine', cloud_run:'Cloud Run',
+          cert_cloud_hostname:'SSL Cert Hostname', github_leak:'GitHub Leak', shodan_subdomain:'Shodan Subdomain', shodan_ip:'Shodan IP'
+        };
+        tbody.innerHTML = data.results.map(f => {
+          const sev = f.severity || 'info';
+          const asset = f.url || f.name || f.hostname || f.fqdn || '-';
+          const prov = provider(f.type);
+          const label = typeLabel[f.type] || f.type;
+          const scanned = f.scanned_at ? f.scanned_at.split('T')[0] : '-';
+          const rowBg = sev === 'critical' ? ' style="background:#2e1e1e;"' : sev === 'high' ? ' style="background:#2e2a1e;"' : '';
+          return `<tr${rowBg}>
+            <td style="color:#7fbbb3">${prov}</td>
+            <td style="color:#d3c6aa">${label}</td>
+            <td class="domain"><a href="${asset.startsWith('http') ? asset : '#'}" target="_blank" style="color:#83c092;text-decoration:none">${asset}</a></td>
+            <td style="color:${sevColor(sev)}">${sev}</td>
+            <td style="color:#5c6a72;font-size:0.8rem">${f.detail || '-'}</td>
+            <td style="color:#5c6a72;font-size:0.8rem">${scanned}</td>
+          </tr>`;
+        }).join('');
+      } catch(e) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:#e67e80">error: ${e.message}</td></tr>`;
+      }
     }
 
     async function loadTakeovers(inscopeOnly) {
@@ -641,7 +758,8 @@ def stats():
         umbrella_count = umbrella.count_documents({})
         takeover_count = stab_col.count_documents({})
         in_scope_count = collection.count_documents({"in_scope_program": {"$ne": None}})
-        return jsonify({"total": total, "unique_domains": len(domains), "unique_ips": len(ips), "umbrella_count": umbrella_count, "takeover_count": takeover_count, "in_scope_count": in_scope_count})
+        cloud_count = draco_col.count_documents({})
+        return jsonify({"total": total, "unique_domains": len(domains), "unique_ips": len(ips), "umbrella_count": umbrella_count, "takeover_count": takeover_count, "in_scope_count": in_scope_count, "cloud_count": cloud_count})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -805,6 +923,62 @@ def trigger_import_scopes():
 @require_auth
 def import_scopes_status():
     return jsonify(_import_status)
+
+
+@app.route("/run_draco", methods=["POST"])
+@require_auth
+def trigger_run_draco():
+    global _draco_status
+    if _draco_status["running"]:
+        return jsonify({"status": "already_running"}), 409
+
+    domain = (request.json or {}).get("domain", "").strip()
+    if not domain:
+        return jsonify({"error": "domain required"}), 400
+
+    def run():
+        global _draco_status
+        _draco_status["running"] = True
+        _draco_status["error"] = None
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_draco.py")
+            result = subprocess.run(
+                [sys.executable, script, "--domain", domain, "--no-intel"],
+                capture_output=True, text=True, timeout=600
+            )
+            _draco_status["last_result"] = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                _draco_status["error"] = result.stderr.strip()
+        except Exception as e:
+            _draco_status["error"] = str(e)
+            _draco_status["last_result"] = str(e)
+        finally:
+            _draco_status["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "started", "domain": domain}), 202
+
+
+@app.route("/run_draco/status", methods=["GET"])
+@require_auth
+def run_draco_status():
+    return jsonify(_draco_status)
+
+
+@app.route("/draco_results", methods=["GET"])
+@require_auth
+def draco_results():
+    try:
+        domain_filter = request.args.get("domain", "").strip().lower()
+        query = {}
+        if domain_filter:
+            query["target_domain"] = {"$regex": re.escape(domain_filter), "$options": "i"}
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        results = list(draco_col.find(query, {"_id": 0, "_key": 0}).sort("scanned_at", -1))
+        results.sort(key=lambda x: severity_order.get(x.get("severity"), 5))
+        return jsonify({"count": len(results), "results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/<path:any_path>", methods=["GET"])
