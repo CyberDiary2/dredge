@@ -227,7 +227,10 @@ DASHBOARD = """
           <input type="text" id="t-filter" placeholder="t-mobile.com" style="border-color: #c03060;">
         </div>
         <div class="field" style="justify-content: flex-end;">
-          <button class="btn" style="background: #4c3743; color: #e67e80; border: 1px solid #c03060;" onclick="loadTakeovers()">show takeovers</button>
+          <button class="btn" style="background: #4c3743; color: #e67e80; border: 1px solid #c03060;" onclick="loadTakeovers(false)">show all</button>
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" style="background: #2d4a35; color: #83c092; border: 1px solid #4a7c59;" onclick="loadTakeovers(true)">in scope only</button>
         </div>
       </div>
       <div id="takeover-results" style="margin-top: 14px; display: none;">
@@ -352,14 +355,18 @@ DASHBOARD = """
       }, 3000);
     }
 
-    async function loadTakeovers() {
+    async function loadTakeovers(inscopeOnly) {
       const filter = document.getElementById('t-filter').value.trim();
       const tbody = document.getElementById('takeover-tbody');
       const panel = document.getElementById('takeover-results');
       tbody.innerHTML = '<tr><td colspan="5" style="color:#7fbbb3">loading...</td></tr>';
       panel.style.display = 'block';
       try {
-        const url = filter ? `/takeovers?filter=${encodeURIComponent(filter)}` : '/takeovers';
+        let url = '/takeovers';
+        const params = [];
+        if (filter) params.push(`filter=${encodeURIComponent(filter)}`);
+        if (inscopeOnly) params.push('inscope=true');
+        if (params.length) url += '?' + params.join('&');
         const r = await fetch(url);
         const data = await r.json();
         if (!data.results || data.results.length === 0) {
@@ -676,8 +683,21 @@ def inscope():
 def takeovers():
     try:
         filter_param = request.args.get("filter", "").strip()
+        inscope_only = request.args.get("inscope", "false").lower() == "true"
         query = {"filter": {"$regex": filter_param, "$options": "i"}} if filter_param else {}
         results = list(stab_col.find(query, {"_id": 0}).sort("scanned_at", -1))
+        if inscope_only:
+            scope_domains = set()
+            for s in db["scopes"].find({}, {"asset": 1, "_id": 0}):
+                scope_domains.add(s.get("asset", "").lower().lstrip("*."))
+            def is_inscope(subdomain):
+                d = subdomain.lower()
+                parts = d.split(".")
+                for i in range(len(parts) - 1):
+                    if ".".join(parts[i:]) in scope_domains:
+                        return True
+                return False
+            results = [r for r in results if is_inscope(r.get("subdomain", ""))]
         return jsonify({"count": len(results), "results": results})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
