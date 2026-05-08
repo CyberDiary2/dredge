@@ -78,7 +78,37 @@ except Exception as e:
 _import_lock = threading.Lock()
 _import_status = {"running": False, "last_result": None, "error": None}
 _stab_status = {"running": False, "last_result": None, "error": None}
-_draco_status = {"running": False, "last_result": None, "error": None}
+_draco_lock = threading.Lock()
+_draco_status = {
+    "running": False, "current_domain": None, "queue": [],
+    "completed": [], "errors": [], "last_result": None, "error": None,
+}
+
+
+def _draco_worker():
+    global _draco_status
+    while True:
+        with _draco_lock:
+            if not _draco_status["queue"]:
+                _draco_status["running"] = False
+                _draco_status["current_domain"] = None
+                return
+            domain = _draco_status["queue"].pop(0)
+            _draco_status["current_domain"] = domain
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_draco.py")
+            result = subprocess.run(
+                [sys.executable, script, "--domain", domain, "--no-intel"],
+                capture_output=True, text=True, timeout=600
+            )
+            with _draco_lock:
+                _draco_status["completed"].append(domain)
+                _draco_status["last_result"] = (result.stdout + result.stderr).strip()
+                if result.returncode != 0:
+                    _draco_status["errors"].append({"domain": domain, "error": result.stderr.strip()})
+        except Exception as e:
+            with _draco_lock:
+                _draco_status["errors"].append({"domain": domain, "error": str(e)})
 
 
 @app.errorhandler(Exception)
@@ -251,13 +281,21 @@ DASHBOARD = """
           <label style="color: #7fbbb3;">target domain</label>
           <input type="text" id="d-domain" placeholder="t-mobile.com" style="border-color: #4a6c7c;">
         </div>
+        <div class="field">
+          <label style="color: #7fbbb3;">or: program name (in-scope)</label>
+          <input type="text" id="d-program" placeholder="T-Mobile" style="border-color: #4a6c7c;">
+        </div>
         <div class="field" style="justify-content: flex-end;">
           <button class="btn" id="btn-run-draco" style="background: #3a5a6c; border: 1px solid #7fbbb3; color: #7fbbb3;" onclick="runDraco()">run draco</button>
+        </div>
+        <div class="field" style="justify-content: flex-end;">
+          <button class="btn" id="btn-run-draco-inscope" style="background: #2d4a35; border: 1px solid #4a7c59; color: #83c092;" onclick="runDracoInScope()">run on in-scope program</button>
         </div>
         <div class="field" style="justify-content: flex-end;">
           <button class="btn" style="background: #2d4050; border: 1px solid #7fbbb3; color: #7fbbb3;" onclick="loadDraco()">show results</button>
         </div>
       </div>
+      <div id="draco-progress" style="display:none; margin-top:10px; color:#7fbbb3; font-size:0.85rem;"></div>
       <div id="draco-results" style="margin-top: 14px; display: none;">
         <table>
           <thead><tr>
@@ -415,15 +453,51 @@ DASHBOARD = """
           const r = await fetch('/run_draco/status');
           const data = await r.json();
           const btn = document.getElementById('btn-run-draco');
+          const btnIS = document.getElementById('btn-run-draco-inscope');
+          const prog = document.getElementById('draco-progress');
+          const total = (data.completed || []).length + (data.queue || []).length + (data.current_domain ? 1 : 0);
+          const done = (data.completed || []).length;
+          if (data.running) {
+            prog.style.display = 'block';
+            prog.textContent = total > 1
+              ? `scanning ${done + 1} / ${total}: ${data.current_domain || '...'} -- ${data.queue.length} remaining`
+              : `scanning: ${data.current_domain || '...'}`;
+          }
           if (!data.running) {
             clearInterval(_dracoPollInterval);
+            prog.style.display = 'none';
             btn.disabled = false;
-            btn.style.color = data.error ? '#e67e80' : '#83c092';
-            btn.textContent = data.error ? 'draco failed' : 'run draco';
-            if (!data.error) { fetchStats(); loadDraco(); }
+            btn.style.color = (data.errors || []).length > 0 ? '#e67e80' : '#83c092';
+            btn.textContent = 'run draco';
+            btnIS.disabled = false;
+            btnIS.style.color = '#83c092';
+            btnIS.textContent = 'run on in-scope program';
+            if (done > 0) { fetchStats(); loadDraco(); }
           }
         } catch(e) { clearInterval(_dracoPollInterval); }
       }, 3000);
+    }
+
+    async function runDracoInScope() {
+      const program = document.getElementById('d-program').value.trim();
+      if (!program) { alert('enter a program name to filter (e.g. T-Mobile)'); return; }
+      const btn = document.getElementById('btn-run-draco-inscope');
+      const btnDraco = document.getElementById('btn-run-draco');
+      btn.disabled = true;
+      btnDraco.disabled = true;
+      btn.textContent = `queuing domains for "${program}"...`;
+      try {
+        const r = await fetch('/run_draco_inscope', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({program})
+        });
+        const data = await r.json();
+        if (r.status === 409) { btn.textContent = 'draco already running'; pollDracoStatus(); return; }
+        if (!r.ok) { btn.disabled = false; btnDraco.disabled = false; btn.textContent = 'run on in-scope program'; alert(data.error || 'failed'); return; }
+        btn.textContent = `running ${data.total_domains} domain${data.total_domains !== 1 ? 's' : ''}...`;
+        pollDracoStatus();
+      } catch(e) { btn.disabled = false; btnDraco.disabled = false; btn.textContent = 'run on in-scope program'; }
     }
 
     async function loadDraco() {
@@ -929,40 +1003,65 @@ def import_scopes_status():
 @require_auth
 def trigger_run_draco():
     global _draco_status
-    if _draco_status["running"]:
-        return jsonify({"status": "already_running"}), 409
-
-    domain = (request.json or {}).get("domain", "").strip()
-    if not domain:
-        return jsonify({"error": "domain required"}), 400
-
-    def run():
-        global _draco_status
+    with _draco_lock:
+        if _draco_status["running"]:
+            return jsonify({"status": "already_running"}), 409
+        domain = (request.json or {}).get("domain", "").strip()
+        if not domain:
+            return jsonify({"error": "domain required"}), 400
         _draco_status["running"] = True
+        _draco_status["queue"] = [domain]
+        _draco_status["completed"] = []
+        _draco_status["errors"] = []
+        _draco_status["current_domain"] = None
         _draco_status["error"] = None
-        try:
-            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_draco.py")
-            result = subprocess.run(
-                [sys.executable, script, "--domain", domain, "--no-intel"],
-                capture_output=True, text=True, timeout=600
-            )
-            _draco_status["last_result"] = (result.stdout + result.stderr).strip()
-            if result.returncode != 0:
-                _draco_status["error"] = result.stderr.strip()
-        except Exception as e:
-            _draco_status["error"] = str(e)
-            _draco_status["last_result"] = str(e)
-        finally:
-            _draco_status["running"] = False
-
-    threading.Thread(target=run, daemon=True).start()
+        _draco_status["last_result"] = None
+    threading.Thread(target=_draco_worker, daemon=True).start()
     return jsonify({"status": "started", "domain": domain}), 202
+
+
+@app.route("/run_draco_inscope", methods=["POST"])
+@require_auth
+def trigger_run_draco_inscope():
+    global _draco_status
+    with _draco_lock:
+        if _draco_status["running"]:
+            return jsonify({"status": "already_running"}), 409
+
+    program_filter = (request.json or {}).get("program", "").strip()
+    query = {}
+    if program_filter:
+        query["program"] = {"$regex": re.escape(program_filter), "$options": "i"}
+
+    scope_assets = list(db["scopes"].find(query, {"asset": 1, "_id": 0}))
+    base_domains = set()
+    for s in scope_assets:
+        asset = s.get("asset", "").lower().lstrip("*.")
+        parts = asset.split(".")
+        if len(parts) >= 2:
+            base_domains.add(".".join(parts[-2:]))
+
+    if not base_domains:
+        return jsonify({"error": "no domains found for that program"}), 404
+
+    domains = sorted(base_domains)
+    with _draco_lock:
+        _draco_status["running"] = True
+        _draco_status["queue"] = domains
+        _draco_status["completed"] = []
+        _draco_status["errors"] = []
+        _draco_status["current_domain"] = None
+        _draco_status["error"] = None
+        _draco_status["last_result"] = None
+    threading.Thread(target=_draco_worker, daemon=True).start()
+    return jsonify({"status": "started", "total_domains": len(domains)}), 202
 
 
 @app.route("/run_draco/status", methods=["GET"])
 @require_auth
 def run_draco_status():
-    return jsonify(_draco_status)
+    with _draco_lock:
+        return jsonify(dict(_draco_status))
 
 
 @app.route("/draco_results", methods=["GET"])
